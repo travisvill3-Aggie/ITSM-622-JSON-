@@ -10,7 +10,7 @@
 
 # ==============================================================================
 # ISTM 622 – JSON Milestone
-# Automated User-Data Script
+# Full automation script for GitHub-hosted setup.sh
 # Installs MariaDB, rebuilds POS, and generates:
 #   /var/lib/mysql-files/prod.json
 #   /var/lib/mysql-files/cust.json
@@ -378,31 +378,37 @@ USE POS;
 -- CASE 1: Product Details View
 -- prod.json
 -- ============================================================
+WITH product_customer_rows AS (
+  SELECT
+    ol.product_id,
+    c.id AS CustomerID,
+    CONCAT(c.firstName, ' ', c.lastName) AS CustomerName
+  FROM Orderline ol
+  JOIN `Order` o ON o.id = ol.order_id
+  JOIN Customer c ON c.id = o.customer_id
+  GROUP BY ol.product_id, c.id, c.firstName, c.lastName
+),
+product_customer_json AS (
+  SELECT
+    product_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'CustomerID', CustomerID,
+        'CustomerName', CustomerName
+      )
+    ) AS customers_json
+  FROM product_customer_rows
+  GROUP BY product_id
+)
 SELECT JSON_OBJECT(
   'ProductID', p.id,
   'currentPrice', p.currentPrice,
   'productName', p.name,
-  'customers',
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-                 JSON_OBJECT(
-                   'CustomerID', x.id,
-                   'CustomerName', CONCAT(x.firstName, ' ', x.lastName)
-                 )
-               )
-        FROM (
-          SELECT DISTINCT c.id, c.firstName, c.lastName
-          FROM Orderline ol
-          JOIN `Order` o ON o.id = ol.order_id
-          JOIN Customer c ON c.id = o.customer_id
-          WHERE ol.product_id = p.id
-        ) AS x
-      ),
-      JSON_ARRAY()
-    )
+  'customers', COALESCE(pcj.customers_json, JSON_ARRAY())
 )
 FROM Product p
+LEFT JOIN product_customer_json pcj
+  ON pcj.product_id = p.id
 ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/prod.json'
 FIELDS TERMINATED BY ''
@@ -413,6 +419,39 @@ LINES TERMINATED BY '\n';
 -- CASE 2: Customer Dashboard
 -- cust.json
 -- ============================================================
+WITH item_json AS (
+  SELECT
+    ol.order_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'ProductID', p.id,
+        'Quantity', ol.quantity,
+        'ProductName', p.name
+      )
+    ) AS items_json,
+    ROUND(COALESCE(SUM(p.currentPrice * ol.quantity), 0), 2) AS order_total
+  FROM Orderline ol
+  JOIN Product p
+    ON p.id = ol.product_id
+  GROUP BY ol.order_id
+),
+order_json AS (
+  SELECT
+    o.customer_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'OrderID', o.id,
+        'OrderDate', o.datePlaced,
+        'ShippingDate', o.dateShipped,
+        'OrderTotal', COALESCE(ij.order_total, 0),
+        'items', COALESCE(ij.items_json, JSON_ARRAY())
+      )
+    ) AS orders_json
+  FROM `Order` o
+  LEFT JOIN item_json ij
+    ON ij.order_id = o.id
+  GROUP BY o.customer_id
+)
 SELECT JSON_OBJECT(
   'CustomerID', c.id,
   'customer_name', CONCAT(c.firstName, ' ', c.lastName),
@@ -423,47 +462,13 @@ SELECT JSON_OBJECT(
     END,
   'printed_address_2',
     CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-  'orders',
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-                 JSON_OBJECT(
-                   'OrderID', o.id,
-                   'OrderDate', o.datePlaced,
-                   'ShippingDate', o.dateShipped,
-                   'OrderTotal',
-                     (
-                       SELECT ROUND(COALESCE(SUM(p2.currentPrice * ol2.quantity), 0), 2)
-                       FROM Orderline ol2
-                       JOIN Product p2 ON p2.id = ol2.product_id
-                       WHERE ol2.order_id = o.id
-                     ),
-                   'items',
-                     COALESCE(
-                       (
-                         SELECT JSON_ARRAYAGG(
-                                  JSON_OBJECT(
-                                    'ProductID', p3.id,
-                                    'Quantity', ol3.quantity,
-                                    'ProductName', p3.name
-                                  )
-                                )
-                         FROM Orderline ol3
-                         JOIN Product p3 ON p3.id = ol3.product_id
-                         WHERE ol3.order_id = o.id
-                       ),
-                       JSON_ARRAY()
-                     )
-                 )
-               )
-        FROM `Order` o
-        WHERE o.customer_id = c.id
-      ),
-      JSON_ARRAY()
-    )
+  'orders', COALESCE(oj.orders_json, JSON_ARRAY())
 )
 FROM Customer c
-JOIN City ci ON ci.zip = c.zip
+JOIN City ci
+  ON ci.zip = c.zip
+LEFT JOIN order_json oj
+  ON oj.customer_id = c.id
 ORDER BY c.id
 INTO OUTFILE '/var/lib/mysql-files/cust.json'
 FIELDS TERMINATED BY ''
@@ -474,62 +479,66 @@ LINES TERMINATED BY '\n';
 -- CASE 3: Inventory Demand Signal
 -- custom1.json
 -- ============================================================
+WITH product_order_rows AS (
+  SELECT
+    ol.product_id,
+    o.id AS OrderID,
+    o.datePlaced AS OrderDate,
+    c.id AS CustomerID,
+    CONCAT(c.firstName, ' ', c.lastName) AS CustomerName,
+    ci.state AS State,
+    ol.quantity AS Quantity
+  FROM Orderline ol
+  JOIN `Order` o
+    ON o.id = ol.order_id
+  JOIN Customer c
+    ON c.id = o.customer_id
+  JOIN City ci
+    ON ci.zip = c.zip
+),
+product_order_json AS (
+  SELECT
+    product_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'OrderID', OrderID,
+        'OrderDate', OrderDate,
+        'Customer',
+          JSON_OBJECT(
+            'CustomerID', CustomerID,
+            'CustomerName', CustomerName,
+            'State', State
+          ),
+        'Quantity', Quantity
+      )
+    ) AS recent_orders_json
+  FROM product_order_rows
+  GROUP BY product_id
+),
+product_rollup AS (
+  SELECT
+    ol.product_id,
+    SUM(ol.quantity) AS total_units_sold,
+    COUNT(DISTINCT o.customer_id) AS unique_customer_count
+  FROM Orderline ol
+  JOIN `Order` o
+    ON o.id = ol.order_id
+  GROUP BY ol.product_id
+)
 SELECT JSON_OBJECT(
   'ProductID', p.id,
   'productName', p.name,
   'currentPrice', p.currentPrice,
   'availableQuantity', p.availableQuantity,
-  'total_units_sold',
-    COALESCE(
-      (SELECT SUM(ol.quantity) FROM Orderline ol WHERE ol.product_id = p.id),
-      0
-    ),
-  'unique_customer_count',
-    COALESCE(
-      (
-        SELECT COUNT(DISTINCT o.customer_id)
-        FROM Orderline ol
-        JOIN `Order` o ON o.id = ol.order_id
-        WHERE ol.product_id = p.id
-      ),
-      0
-    ),
-  'recent_orders',
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-                 JSON_OBJECT(
-                   'OrderID', y.order_id,
-                   'OrderDate', y.datePlaced,
-                   'Customer',
-                     JSON_OBJECT(
-                       'CustomerID', y.customer_id,
-                       'CustomerName', y.customer_name,
-                       'State', y.state
-                     ),
-                   'Quantity', y.quantity
-                 )
-               )
-        FROM (
-          SELECT
-            o.id AS order_id,
-            o.datePlaced,
-            c.id AS customer_id,
-            CONCAT(c.firstName, ' ', c.lastName) AS customer_name,
-            ci.state,
-            ol.quantity
-          FROM Orderline ol
-          JOIN `Order` o ON o.id = ol.order_id
-          JOIN Customer c ON c.id = o.customer_id
-          JOIN City ci ON ci.zip = c.zip
-          WHERE ol.product_id = p.id
-          ORDER BY o.datePlaced DESC, o.id DESC
-        ) AS y
-      ),
-      JSON_ARRAY()
-    )
+  'total_units_sold', COALESCE(pr.total_units_sold, 0),
+  'unique_customer_count', COALESCE(pr.unique_customer_count, 0),
+  'recent_orders', COALESCE(poj.recent_orders_json, JSON_ARRAY())
 )
 FROM Product p
+LEFT JOIN product_rollup pr
+  ON pr.product_id = p.id
+LEFT JOIN product_order_json poj
+  ON poj.product_id = p.id
 ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/custom1.json'
 FIELDS TERMINATED BY ''
@@ -540,72 +549,72 @@ LINES TERMINATED BY '\n';
 -- CASE 4: Regional Delivery Manifest
 -- custom2.json
 -- ============================================================
+WITH item_json AS (
+  SELECT
+    ol.order_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'ProductID', p.id,
+        'ProductName', p.name,
+        'Quantity', ol.quantity
+      )
+    ) AS items_json
+  FROM Orderline ol
+  JOIN Product p
+    ON p.id = ol.product_id
+  GROUP BY ol.order_id
+),
+order_json AS (
+  SELECT
+    o.customer_id,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'OrderID', o.id,
+        'OrderDate', o.datePlaced,
+        'ShippingDate', o.dateShipped,
+        'items', COALESCE(ij.items_json, JSON_ARRAY())
+      )
+    ) AS orders_json
+  FROM `Order` o
+  LEFT JOIN item_json ij
+    ON ij.order_id = o.id
+  GROUP BY o.customer_id
+),
+customer_json_by_state AS (
+  SELECT
+    ci.state,
+    JSON_ARRAYAGG(
+      JSON_OBJECT(
+        'CustomerID', c.id,
+        'CustomerName', CONCAT(c.firstName, ' ', c.lastName),
+        'printed_address_1',
+          CASE
+            WHEN c.address2 IS NULL OR c.address2 = '' THEN c.address1
+            ELSE CONCAT(c.address1, ' #', c.address2)
+          END,
+        'printed_address_2',
+          CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
+        'orders', COALESCE(oj.orders_json, JSON_ARRAY())
+      )
+    ) AS customers_json
+  FROM Customer c
+  JOIN City ci
+    ON ci.zip = c.zip
+  LEFT JOIN order_json oj
+    ON oj.customer_id = c.id
+  GROUP BY ci.state
+)
 SELECT JSON_OBJECT(
   'State', s.state,
-  'customers',
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-                 JSON_OBJECT(
-                   'CustomerID', z.customer_id,
-                   'CustomerName', z.customer_name,
-                   'printed_address_1', z.printed_address_1,
-                   'printed_address_2', z.printed_address_2,
-                   'orders',
-                     COALESCE(
-                       (
-                         SELECT JSON_ARRAYAGG(
-                                  JSON_OBJECT(
-                                    'OrderID', o.id,
-                                    'OrderDate', o.datePlaced,
-                                    'ShippingDate', o.dateShipped,
-                                    'items',
-                                      COALESCE(
-                                        (
-                                          SELECT JSON_ARRAYAGG(
-                                                   JSON_OBJECT(
-                                                     'ProductID', p.id,
-                                                     'ProductName', p.name,
-                                                     'Quantity', ol.quantity
-                                                   )
-                                                 )
-                                          FROM Orderline ol
-                                          JOIN Product p ON p.id = ol.product_id
-                                          WHERE ol.order_id = o.id
-                                        ),
-                                        JSON_ARRAY()
-                                      )
-                                  )
-                                )
-                         FROM `Order` o
-                         WHERE o.customer_id = z.customer_id
-                       ),
-                       JSON_ARRAY()
-                     )
-                 )
-               )
-        FROM (
-          SELECT
-            c.id AS customer_id,
-            CONCAT(c.firstName, ' ', c.lastName) AS customer_name,
-            CASE
-              WHEN c.address2 IS NULL OR c.address2 = '' THEN c.address1
-              ELSE CONCAT(c.address1, ' #', c.address2)
-            END AS printed_address_1,
-            CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')) AS printed_address_2
-          FROM Customer c
-          JOIN City ci ON ci.zip = c.zip
-          WHERE ci.state = s.state
-        ) AS z
-      ),
-      JSON_ARRAY()
-    )
+  'customers', COALESCE(cjs.customers_json, JSON_ARRAY())
 )
 FROM (
   SELECT DISTINCT state
   FROM City
   WHERE state IS NOT NULL AND state <> ''
-) AS s
+) s
+LEFT JOIN customer_json_by_state cjs
+  ON cjs.state = s.state
 ORDER BY s.state
 INTO OUTFILE '/var/lib/mysql-files/custom2.json'
 FIELDS TERMINATED BY ''
@@ -613,7 +622,10 @@ ESCAPED BY ''
 LINES TERMINATED BY '\n';
 EOF
 
-chown "${LINUX_USER}:${LINUX_USER}" "${HOME_DIR}/etl.sql" "${HOME_DIR}/views.sql" "${HOME_DIR}/json.sql"
+chown "${LINUX_USER}:${LINUX_USER}" \
+  "${HOME_DIR}/etl.sql" \
+  "${HOME_DIR}/views.sql" \
+  "${HOME_DIR}/json.sql"
 
 # ========================
 # REMOVE OLD JSON FILES
