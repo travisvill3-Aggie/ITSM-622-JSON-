@@ -74,6 +74,7 @@ sleep 5
 # CREATE LINUX USER
 # ========================
 id -u "${LINUX_USER}" &>/dev/null || useradd -m -s /bin/bash "${LINUX_USER}"
+chmod 755 "${HOME_DIR}"
 
 # ========================
 # DOWNLOAD SOURCE DATA
@@ -378,28 +379,32 @@ USE POS;
 -- CASE 1: Product Details View
 -- prod.json
 -- ============================================================
-WITH product_customer_rows AS (
-  SELECT
-    ol.product_id,
-    c.id AS CustomerID,
-    CONCAT(c.firstName, ' ', c.lastName) AS CustomerName
-  FROM Orderline ol
-  JOIN `Order` o ON o.id = ol.order_id
-  JOIN Customer c ON c.id = o.customer_id
-  GROUP BY ol.product_id, c.id, c.firstName, c.lastName
-),
-product_customer_json AS (
-  SELECT
-    product_id,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'CustomerID', CustomerID,
-        'CustomerName', CustomerName
-      )
-    ) AS customers_json
-  FROM product_customer_rows
-  GROUP BY product_id
-)
+DROP TEMPORARY TABLE IF EXISTS tmp_product_customer_rows;
+CREATE TEMPORARY TABLE tmp_product_customer_rows AS
+SELECT
+  ol.product_id,
+  c.id AS CustomerID,
+  CONCAT(c.firstName, ' ', c.lastName) AS CustomerName
+FROM Orderline ol
+JOIN `Order` o
+  ON o.id = ol.order_id
+JOIN Customer c
+  ON c.id = o.customer_id
+GROUP BY ol.product_id, c.id, c.firstName, c.lastName;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_product_customer_json;
+CREATE TEMPORARY TABLE tmp_product_customer_json AS
+SELECT
+  product_id,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'CustomerID', CustomerID,
+      'CustomerName', CustomerName
+    )
+  ) AS customers_json
+FROM tmp_product_customer_rows
+GROUP BY product_id;
+
 SELECT JSON_OBJECT(
   'ProductID', p.id,
   'currentPrice', p.currentPrice,
@@ -407,7 +412,7 @@ SELECT JSON_OBJECT(
   'customers', COALESCE(pcj.customers_json, JSON_ARRAY())
 )
 FROM Product p
-LEFT JOIN product_customer_json pcj
+LEFT JOIN tmp_product_customer_json pcj
   ON pcj.product_id = p.id
 ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/prod.json'
@@ -419,39 +424,41 @@ LINES TERMINATED BY '\n';
 -- CASE 2: Customer Dashboard
 -- cust.json
 -- ============================================================
-WITH item_json AS (
-  SELECT
-    ol.order_id,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'ProductID', p.id,
-        'Quantity', ol.quantity,
-        'ProductName', p.name
-      )
-    ) AS items_json,
-    ROUND(COALESCE(SUM(p.currentPrice * ol.quantity), 0), 2) AS order_total
-  FROM Orderline ol
-  JOIN Product p
-    ON p.id = ol.product_id
-  GROUP BY ol.order_id
-),
-order_json AS (
-  SELECT
-    o.customer_id,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'OrderID', o.id,
-        'OrderDate', o.datePlaced,
-        'ShippingDate', o.dateShipped,
-        'OrderTotal', COALESCE(ij.order_total, 0),
-        'items', COALESCE(ij.items_json, JSON_ARRAY())
-      )
-    ) AS orders_json
-  FROM `Order` o
-  LEFT JOIN item_json ij
-    ON ij.order_id = o.id
-  GROUP BY o.customer_id
-)
+DROP TEMPORARY TABLE IF EXISTS tmp_item_json;
+CREATE TEMPORARY TABLE tmp_item_json AS
+SELECT
+  ol.order_id,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'ProductID', p.id,
+      'Quantity', ol.quantity,
+      'ProductName', p.name
+    )
+  ) AS items_json,
+  ROUND(COALESCE(SUM(p.currentPrice * ol.quantity), 0), 2) AS order_total
+FROM Orderline ol
+JOIN Product p
+  ON p.id = ol.product_id
+GROUP BY ol.order_id;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_order_json;
+CREATE TEMPORARY TABLE tmp_order_json AS
+SELECT
+  o.customer_id,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'OrderID', o.id,
+      'OrderDate', o.datePlaced,
+      'ShippingDate', o.dateShipped,
+      'OrderTotal', COALESCE(ij.order_total, 0),
+      'items', COALESCE(ij.items_json, JSON_ARRAY())
+    )
+  ) AS orders_json
+FROM `Order` o
+LEFT JOIN tmp_item_json ij
+  ON ij.order_id = o.id
+GROUP BY o.customer_id;
+
 SELECT JSON_OBJECT(
   'CustomerID', c.id,
   'customer_name', CONCAT(c.firstName, ' ', c.lastName),
@@ -467,7 +474,7 @@ SELECT JSON_OBJECT(
 FROM Customer c
 JOIN City ci
   ON ci.zip = c.zip
-LEFT JOIN order_json oj
+LEFT JOIN tmp_order_json oj
   ON oj.customer_id = c.id
 ORDER BY c.id
 INTO OUTFILE '/var/lib/mysql-files/cust.json'
@@ -479,52 +486,55 @@ LINES TERMINATED BY '\n';
 -- CASE 3: Inventory Demand Signal
 -- custom1.json
 -- ============================================================
-WITH product_order_rows AS (
-  SELECT
-    ol.product_id,
-    o.id AS OrderID,
-    o.datePlaced AS OrderDate,
-    c.id AS CustomerID,
-    CONCAT(c.firstName, ' ', c.lastName) AS CustomerName,
-    ci.state AS State,
-    ol.quantity AS Quantity
-  FROM Orderline ol
-  JOIN `Order` o
-    ON o.id = ol.order_id
-  JOIN Customer c
-    ON c.id = o.customer_id
-  JOIN City ci
-    ON ci.zip = c.zip
-),
-product_order_json AS (
-  SELECT
-    product_id,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'OrderID', OrderID,
-        'OrderDate', OrderDate,
-        'Customer',
-          JSON_OBJECT(
-            'CustomerID', CustomerID,
-            'CustomerName', CustomerName,
-            'State', State
-          ),
-        'Quantity', Quantity
-      )
-    ) AS recent_orders_json
-  FROM product_order_rows
-  GROUP BY product_id
-),
-product_rollup AS (
-  SELECT
-    ol.product_id,
-    SUM(ol.quantity) AS total_units_sold,
-    COUNT(DISTINCT o.customer_id) AS unique_customer_count
-  FROM Orderline ol
-  JOIN `Order` o
-    ON o.id = ol.order_id
-  GROUP BY ol.product_id
-)
+DROP TEMPORARY TABLE IF EXISTS tmp_product_order_rows;
+CREATE TEMPORARY TABLE tmp_product_order_rows AS
+SELECT
+  ol.product_id,
+  o.id AS OrderID,
+  o.datePlaced AS OrderDate,
+  c.id AS CustomerID,
+  CONCAT(c.firstName, ' ', c.lastName) AS CustomerName,
+  ci.state AS StateName,
+  ol.quantity AS Quantity
+FROM Orderline ol
+JOIN `Order` o
+  ON o.id = ol.order_id
+JOIN Customer c
+  ON c.id = o.customer_id
+JOIN City ci
+  ON ci.zip = c.zip;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_product_order_json;
+CREATE TEMPORARY TABLE tmp_product_order_json AS
+SELECT
+  product_id,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'OrderID', OrderID,
+      'OrderDate', OrderDate,
+      'Customer',
+        JSON_OBJECT(
+          'CustomerID', CustomerID,
+          'CustomerName', CustomerName,
+          'State', StateName
+        ),
+      'Quantity', Quantity
+    )
+  ) AS recent_orders_json
+FROM tmp_product_order_rows
+GROUP BY product_id;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_product_rollup;
+CREATE TEMPORARY TABLE tmp_product_rollup AS
+SELECT
+  ol.product_id,
+  SUM(ol.quantity) AS total_units_sold,
+  COUNT(DISTINCT o.customer_id) AS unique_customer_count
+FROM Orderline ol
+JOIN `Order` o
+  ON o.id = ol.order_id
+GROUP BY ol.product_id;
+
 SELECT JSON_OBJECT(
   'ProductID', p.id,
   'productName', p.name,
@@ -535,9 +545,9 @@ SELECT JSON_OBJECT(
   'recent_orders', COALESCE(poj.recent_orders_json, JSON_ARRAY())
 )
 FROM Product p
-LEFT JOIN product_rollup pr
+LEFT JOIN tmp_product_rollup pr
   ON pr.product_id = p.id
-LEFT JOIN product_order_json poj
+LEFT JOIN tmp_product_order_json poj
   ON poj.product_id = p.id
 ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/custom1.json'
@@ -549,61 +559,64 @@ LINES TERMINATED BY '\n';
 -- CASE 4: Regional Delivery Manifest
 -- custom2.json
 -- ============================================================
-WITH item_json AS (
-  SELECT
-    ol.order_id,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'ProductID', p.id,
-        'ProductName', p.name,
-        'Quantity', ol.quantity
-      )
-    ) AS items_json
-  FROM Orderline ol
-  JOIN Product p
-    ON p.id = ol.product_id
-  GROUP BY ol.order_id
-),
-order_json AS (
-  SELECT
-    o.customer_id,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'OrderID', o.id,
-        'OrderDate', o.datePlaced,
-        'ShippingDate', o.dateShipped,
-        'items', COALESCE(ij.items_json, JSON_ARRAY())
-      )
-    ) AS orders_json
-  FROM `Order` o
-  LEFT JOIN item_json ij
-    ON ij.order_id = o.id
-  GROUP BY o.customer_id
-),
-customer_json_by_state AS (
-  SELECT
-    ci.state,
-    JSON_ARRAYAGG(
-      JSON_OBJECT(
-        'CustomerID', c.id,
-        'CustomerName', CONCAT(c.firstName, ' ', c.lastName),
-        'printed_address_1',
-          CASE
-            WHEN c.address2 IS NULL OR c.address2 = '' THEN c.address1
-            ELSE CONCAT(c.address1, ' #', c.address2)
-          END,
-        'printed_address_2',
-          CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-        'orders', COALESCE(oj.orders_json, JSON_ARRAY())
-      )
-    ) AS customers_json
-  FROM Customer c
-  JOIN City ci
-    ON ci.zip = c.zip
-  LEFT JOIN order_json oj
-    ON oj.customer_id = c.id
-  GROUP BY ci.state
-)
+DROP TEMPORARY TABLE IF EXISTS tmp_delivery_item_json;
+CREATE TEMPORARY TABLE tmp_delivery_item_json AS
+SELECT
+  ol.order_id,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'ProductID', p.id,
+      'ProductName', p.name,
+      'Quantity', ol.quantity
+    )
+  ) AS items_json
+FROM Orderline ol
+JOIN Product p
+  ON p.id = ol.product_id
+GROUP BY ol.order_id;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_delivery_order_json;
+CREATE TEMPORARY TABLE tmp_delivery_order_json AS
+SELECT
+  o.customer_id,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'OrderID', o.id,
+      'OrderDate', o.datePlaced,
+      'ShippingDate', o.dateShipped,
+      'items', COALESCE(dij.items_json, JSON_ARRAY())
+    )
+  ) AS orders_json
+FROM `Order` o
+LEFT JOIN tmp_delivery_item_json dij
+  ON dij.order_id = o.id
+GROUP BY o.customer_id;
+
+DROP TEMPORARY TABLE IF EXISTS tmp_customer_json_by_state;
+CREATE TEMPORARY TABLE tmp_customer_json_by_state AS
+SELECT
+  ci.state,
+  JSON_ARRAYAGG(
+    JSON_OBJECT(
+      'CustomerID', c.id,
+      'CustomerName', CONCAT(c.firstName, ' ', c.lastName),
+      'printed_address_1',
+        CASE
+          WHEN c.address2 IS NULL OR c.address2 = '' THEN c.address1
+          ELSE CONCAT(c.address1, ' #', c.address2)
+        END,
+      'printed_address_2',
+        CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
+      'orders', COALESCE(doj.orders_json, JSON_ARRAY())
+    )
+  ) AS customers_json
+FROM Customer c
+JOIN City ci
+  ON ci.zip = c.zip
+LEFT JOIN tmp_delivery_order_json doj
+  ON doj.customer_id = c.id
+GROUP BY ci.state;
+
 SELECT JSON_OBJECT(
   'State', s.state,
   'customers', COALESCE(cjs.customers_json, JSON_ARRAY())
@@ -613,7 +626,7 @@ FROM (
   FROM City
   WHERE state IS NOT NULL AND state <> ''
 ) s
-LEFT JOIN customer_json_by_state cjs
+LEFT JOIN tmp_customer_json_by_state cjs
   ON cjs.state = s.state
 ORDER BY s.state
 INTO OUTFILE '/var/lib/mysql-files/custom2.json'
@@ -623,6 +636,11 @@ LINES TERMINATED BY '\n';
 EOF
 
 chown "${LINUX_USER}:${LINUX_USER}" \
+  "${HOME_DIR}/etl.sql" \
+  "${HOME_DIR}/views.sql" \
+  "${HOME_DIR}/json.sql"
+
+chmod 644 \
   "${HOME_DIR}/etl.sql" \
   "${HOME_DIR}/views.sql" \
   "${HOME_DIR}/json.sql"
@@ -639,14 +657,13 @@ rm -f /var/lib/mysql-files/prod.json \
 # EXECUTE SQL SCRIPTS
 # ========================
 echo "### Building database from views.sql ###"
-cd "${HOME_DIR}"
 mariadb --local-infile=1 < "${HOME_DIR}/views.sql"
 
 echo "### Generating JSON files from json.sql ###"
 mariadb < "${HOME_DIR}/json.sql"
 
 echo "### Listing generated files ###"
-ls -l /var/lib/mysql-files/
+ls -l /var/lib/mysql-files/ || true
 
 echo "### JSON Milestone setup completed successfully ###"
 echo "### Review /var/log/user-data.log if you need troubleshooting ###"
