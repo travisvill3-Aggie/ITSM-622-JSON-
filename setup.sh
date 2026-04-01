@@ -375,6 +375,10 @@ EOF
 cat > "${HOME_DIR}/json.sql" <<'EOF'
 USE POS;
 
+-- ============================================================
+-- CASE 1: Product Details View
+-- prod.json
+-- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_product_customer_rows;
 CREATE TEMPORARY TABLE tmp_product_customer_rows AS
 SELECT
@@ -405,7 +409,7 @@ SELECT JSON_OBJECT(
   'ProductID', p.id,
   'currentPrice', p.currentPrice,
   'productName', p.name,
-  'customers', COALESCE(tmp_product_customer_json.customers_json, JSON_ARRAY())
+  'customers', COALESCE(JSON_EXTRACT(tmp_product_customer_json.customers_json, '$'), JSON_ARRAY())
 )
 FROM Product p
 LEFT JOIN tmp_product_customer_json
@@ -416,6 +420,10 @@ FIELDS TERMINATED BY ''
 ESCAPED BY ''
 LINES TERMINATED BY '\n';
 
+-- ============================================================
+-- CASE 2: Customer Dashboard
+-- cust.json
+-- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_item_json;
 CREATE TEMPORARY TABLE tmp_item_json AS
 SELECT
@@ -443,7 +451,7 @@ SELECT
       'OrderDate', o.datePlaced,
       'ShippingDate', o.dateShipped,
       'OrderTotal', COALESCE(tmp_item_json.order_total, 0),
-      'items', COALESCE(tmp_item_json.items_json, JSON_ARRAY())
+      'items', COALESCE(JSON_EXTRACT(tmp_item_json.items_json, '$'), JSON_ARRAY())
     )
   ) AS orders_json
 FROM `Order` o
@@ -461,7 +469,7 @@ SELECT JSON_OBJECT(
     END,
   'printed_address_2',
     CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-  'orders', COALESCE(tmp_order_json.orders_json, JSON_ARRAY())
+  'orders', COALESCE(JSON_EXTRACT(tmp_order_json.orders_json, '$'), JSON_ARRAY())
 )
 FROM Customer c
 JOIN City ci
@@ -474,6 +482,10 @@ FIELDS TERMINATED BY ''
 ESCAPED BY ''
 LINES TERMINATED BY '\n';
 
+-- ============================================================
+-- CASE 3: Inventory Demand Signal
+-- custom1.json
+-- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_product_order_rows;
 CREATE TEMPORARY TABLE tmp_product_order_rows AS
 SELECT
@@ -530,7 +542,7 @@ SELECT JSON_OBJECT(
   'availableQuantity', p.availableQuantity,
   'total_units_sold', COALESCE(tmp_product_rollup.total_units_sold, 0),
   'unique_customer_count', COALESCE(tmp_product_rollup.unique_customer_count, 0),
-  'recent_orders', COALESCE(tmp_product_order_json.recent_orders_json, JSON_ARRAY())
+  'recent_orders', COALESCE(JSON_EXTRACT(tmp_product_order_json.recent_orders_json, '$'), JSON_ARRAY())
 )
 FROM Product p
 LEFT JOIN tmp_product_rollup
@@ -543,6 +555,10 @@ FIELDS TERMINATED BY ''
 ESCAPED BY ''
 LINES TERMINATED BY '\n';
 
+-- ============================================================
+-- CASE 4: Regional Delivery Manifest
+-- custom2.json
+-- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_delivery_item_json;
 CREATE TEMPORARY TABLE tmp_delivery_item_json AS
 SELECT
@@ -568,7 +584,7 @@ SELECT
       'OrderID', o.id,
       'OrderDate', o.datePlaced,
       'ShippingDate', o.dateShipped,
-      'items', COALESCE(tmp_delivery_item_json.items_json, JSON_ARRAY())
+      'items', COALESCE(JSON_EXTRACT(tmp_delivery_item_json.items_json, '$'), JSON_ARRAY())
     )
   ) AS orders_json
 FROM `Order` o
@@ -591,7 +607,7 @@ SELECT
         END,
       'printed_address_2',
         CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-      'orders', COALESCE(tmp_delivery_order_json.orders_json, JSON_ARRAY())
+      'orders', COALESCE(JSON_EXTRACT(tmp_delivery_order_json.orders_json, '$'), JSON_ARRAY())
     )
   ) AS customers_json
 FROM Customer c
@@ -603,7 +619,7 @@ GROUP BY ci.state;
 
 SELECT JSON_OBJECT(
   'State', s.state,
-  'customers', COALESCE(tmp_customer_json_by_state.customers_json, JSON_ARRAY())
+  'customers', COALESCE(JSON_EXTRACT(tmp_customer_json_by_state.customers_json, '$'), JSON_ARRAY())
 )
 FROM (
   SELECT DISTINCT state
