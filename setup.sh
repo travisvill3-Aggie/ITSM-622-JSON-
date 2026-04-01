@@ -375,10 +375,6 @@ EOF
 cat > "${HOME_DIR}/json.sql" <<'EOF'
 USE POS;
 
--- ============================================================
--- CASE 1: Product Details View
--- prod.json
--- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_product_customer_rows;
 CREATE TEMPORARY TABLE tmp_product_customer_rows AS
 SELECT
@@ -409,21 +405,17 @@ SELECT JSON_OBJECT(
   'ProductID', p.id,
   'currentPrice', p.currentPrice,
   'productName', p.name,
-  'customers', COALESCE(pcj.customers_json, JSON_ARRAY())
+  'customers', COALESCE(tmp_product_customer_json.customers_json, JSON_ARRAY())
 )
 FROM Product p
-LEFT JOIN tmp_product_customer_json pcj
-  ON pcj.product_id = p.id
+LEFT JOIN tmp_product_customer_json
+  ON tmp_product_customer_json.product_id = p.id
 ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/prod.json'
 FIELDS TERMINATED BY ''
 ESCAPED BY ''
 LINES TERMINATED BY '\n';
 
--- ============================================================
--- CASE 2: Customer Dashboard
--- cust.json
--- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_item_json;
 CREATE TEMPORARY TABLE tmp_item_json AS
 SELECT
@@ -450,13 +442,13 @@ SELECT
       'OrderID', o.id,
       'OrderDate', o.datePlaced,
       'ShippingDate', o.dateShipped,
-      'OrderTotal', COALESCE(ij.order_total, 0),
-      'items', COALESCE(ij.items_json, JSON_ARRAY())
+      'OrderTotal', COALESCE(tmp_item_json.order_total, 0),
+      'items', COALESCE(tmp_item_json.items_json, JSON_ARRAY())
     )
   ) AS orders_json
 FROM `Order` o
-LEFT JOIN tmp_item_json ij
-  ON ij.order_id = o.id
+LEFT JOIN tmp_item_json
+  ON tmp_item_json.order_id = o.id
 GROUP BY o.customer_id;
 
 SELECT JSON_OBJECT(
@@ -469,23 +461,19 @@ SELECT JSON_OBJECT(
     END,
   'printed_address_2',
     CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-  'orders', COALESCE(oj.orders_json, JSON_ARRAY())
+  'orders', COALESCE(tmp_order_json.orders_json, JSON_ARRAY())
 )
 FROM Customer c
 JOIN City ci
   ON ci.zip = c.zip
-LEFT JOIN tmp_order_json oj
-  ON oj.customer_id = c.id
+LEFT JOIN tmp_order_json
+  ON tmp_order_json.customer_id = c.id
 ORDER BY c.id
 INTO OUTFILE '/var/lib/mysql-files/cust.json'
 FIELDS TERMINATED BY ''
 ESCAPED BY ''
 LINES TERMINATED BY '\n';
 
--- ============================================================
--- CASE 3: Inventory Demand Signal
--- custom1.json
--- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_product_order_rows;
 CREATE TEMPORARY TABLE tmp_product_order_rows AS
 SELECT
@@ -540,25 +528,21 @@ SELECT JSON_OBJECT(
   'productName', p.name,
   'currentPrice', p.currentPrice,
   'availableQuantity', p.availableQuantity,
-  'total_units_sold', COALESCE(pr.total_units_sold, 0),
-  'unique_customer_count', COALESCE(pr.unique_customer_count, 0),
-  'recent_orders', COALESCE(poj.recent_orders_json, JSON_ARRAY())
+  'total_units_sold', COALESCE(tmp_product_rollup.total_units_sold, 0),
+  'unique_customer_count', COALESCE(tmp_product_rollup.unique_customer_count, 0),
+  'recent_orders', COALESCE(tmp_product_order_json.recent_orders_json, JSON_ARRAY())
 )
 FROM Product p
-LEFT JOIN tmp_product_rollup pr
-  ON pr.product_id = p.id
-LEFT JOIN tmp_product_order_json poj
-  ON poj.product_id = p.id
+LEFT JOIN tmp_product_rollup
+  ON tmp_product_rollup.product_id = p.id
+LEFT JOIN tmp_product_order_json
+  ON tmp_product_order_json.product_id = p.id
 ORDER BY p.id
 INTO OUTFILE '/var/lib/mysql-files/custom1.json'
 FIELDS TERMINATED BY ''
 ESCAPED BY ''
 LINES TERMINATED BY '\n';
 
--- ============================================================
--- CASE 4: Regional Delivery Manifest
--- custom2.json
--- ============================================================
 DROP TEMPORARY TABLE IF EXISTS tmp_delivery_item_json;
 CREATE TEMPORARY TABLE tmp_delivery_item_json AS
 SELECT
@@ -584,12 +568,12 @@ SELECT
       'OrderID', o.id,
       'OrderDate', o.datePlaced,
       'ShippingDate', o.dateShipped,
-      'items', COALESCE(dij.items_json, JSON_ARRAY())
+      'items', COALESCE(tmp_delivery_item_json.items_json, JSON_ARRAY())
     )
   ) AS orders_json
 FROM `Order` o
-LEFT JOIN tmp_delivery_item_json dij
-  ON dij.order_id = o.id
+LEFT JOIN tmp_delivery_item_json
+  ON tmp_delivery_item_json.order_id = o.id
 GROUP BY o.customer_id;
 
 DROP TEMPORARY TABLE IF EXISTS tmp_customer_json_by_state;
@@ -607,27 +591,27 @@ SELECT
         END,
       'printed_address_2',
         CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-      'orders', COALESCE(doj.orders_json, JSON_ARRAY())
+      'orders', COALESCE(tmp_delivery_order_json.orders_json, JSON_ARRAY())
     )
   ) AS customers_json
 FROM Customer c
 JOIN City ci
   ON ci.zip = c.zip
-LEFT JOIN tmp_delivery_order_json doj
-  ON doj.customer_id = c.id
+LEFT JOIN tmp_delivery_order_json
+  ON tmp_delivery_order_json.customer_id = c.id
 GROUP BY ci.state;
 
 SELECT JSON_OBJECT(
   'State', s.state,
-  'customers', COALESCE(cjs.customers_json, JSON_ARRAY())
+  'customers', COALESCE(tmp_customer_json_by_state.customers_json, JSON_ARRAY())
 )
 FROM (
   SELECT DISTINCT state
   FROM City
   WHERE state IS NOT NULL AND state <> ''
 ) s
-LEFT JOIN tmp_customer_json_by_state cjs
-  ON cjs.state = s.state
+LEFT JOIN tmp_customer_json_by_state
+  ON tmp_customer_json_by_state.state = s.state
 ORDER BY s.state
 INTO OUTFILE '/var/lib/mysql-files/custom2.json'
 FIELDS TERMINATED BY ''
@@ -645,22 +629,17 @@ chmod 644 \
   "${HOME_DIR}/views.sql" \
   "${HOME_DIR}/json.sql"
 
-# ========================
-# REMOVE OLD JSON FILES
-# ========================
 rm -f /var/lib/mysql-files/prod.json \
       /var/lib/mysql-files/cust.json \
       /var/lib/mysql-files/custom1.json \
       /var/lib/mysql-files/custom2.json
 
-# ========================
-# EXECUTE SQL SCRIPTS
-# ========================
 echo "### Building database from views.sql ###"
-mariadb --local-infile=1 < "${HOME_DIR}/views.sql"
+cd "${HOME_DIR}"
+mariadb --local-infile=1 < views.sql
 
 echo "### Generating JSON files from json.sql ###"
-mariadb < "${HOME_DIR}/json.sql"
+mariadb < json.sql
 
 echo "### Listing generated files ###"
 ls -l /var/lib/mysql-files/ || true
