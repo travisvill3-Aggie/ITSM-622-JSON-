@@ -5,6 +5,6 @@ exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&
 apt-get update -y
 apt-get install -y curl
 
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/setup.sh -o /tmp/setup.sh
+curl -fsSL https://raw.githubusercontent.com/travisvill3-Aggie/ITSM-622-JSON-/refs/heads/main/MongoDB-M7%20Assignment
 chmod +x /tmp/setup.sh
 bash /tmp/setup.sh
