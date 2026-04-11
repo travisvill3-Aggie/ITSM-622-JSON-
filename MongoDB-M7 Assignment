@@ -8,46 +8,40 @@
 # standards will have serious repercussions.
 # ---------------------------------------------------------------------------
 
-# ==============================================================================
-# ISTM 622 – MongoDB Milestone
-# Full automation script for EC2 User Data / GitHub-hosted setup.sh
-#
-# What this script does:
-# 1. Installs MariaDB and MongoDB Community Edition
-# 2. Starts and enables both services
-# 3. Downloads source CSV data
-# 4. Rebuilds the POS transactional database in MariaDB
-# 5. Generates json.sql outputs
-# 6. Creates sync.sh to refresh MongoDB from MariaDB JSON exports
-# 7. Schedules sync.sh in cron
-# ==============================================================================
-
 exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
 export DEBIAN_FRONTEND=noninteractive
 set -euo pipefail
 
 # ========================
-# VARIABLES
+# VARIABLES - UPDATE THESE
 # ========================
 LINUX_USER="tvillanueva"
 UIN="529004769"
-DATA_URL="https://622.gomillion.org/data/${UIN}.zip"
 HOME_DIR="/home/${LINUX_USER}"
+DATA_URL="https://622.gomillion.org/data/${UIN}.zip"
 MONGO_DB="FurnitureDB"
 
-echo "### Starting ISTM 622 MongoDB Milestone automation ###"
+# CHANGE THIS TO YOUR ACTUAL RAW GITHUB FOLDER
+RAW_BASE="https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main"
+
+ETL_URL="${RAW_BASE}/etl.sql"
+VIEWS_URL="${RAW_BASE}/views.sql"
+JSON_URL="${RAW_BASE}/json.sql"
+
+echo "### Starting ISTM 622 MongoDB milestone setup ###"
 
 # ========================
-# SYSTEM UPDATE
+# SYSTEM PACKAGES
 # ========================
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y curl unzip wget gnupg2 ca-certificates lsb-release apt-transport-https software-properties-common
+apt-get install -y \
+  curl wget unzip gnupg2 ca-certificates lsb-release apt-transport-https \
+  software-properties-common cron
 
 # ========================
-# INSTALL MARIADB 11.8
+# INSTALL MARIADB
 # ========================
-echo "### Installing MariaDB ###"
 mkdir -p /etc/apt/keyrings
 curl -LsS https://mariadb.org/mariadb_release_signing_key.pgp \
   | gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
@@ -62,7 +56,6 @@ apt-get install -y mariadb-server
 # ========================
 # CONFIGURE MARIADB
 # ========================
-echo "### Configuring MariaDB ###"
 mkdir -p /var/lib/mysql-files
 chown mysql:mysql /var/lib/mysql-files
 chmod 750 /var/lib/mysql-files
@@ -80,12 +73,11 @@ sleep 5
 # ========================
 # INSTALL MONGODB COMMUNITY
 # ========================
-echo "### Installing MongoDB Community Edition ###"
 curl -fsSL https://pgp.mongodb.com/server-7.0.asc \
   | gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
 
 cat > /etc/apt/sources.list.d/mongodb-org-7.0.list <<EOF
-deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/7.0 multiverse
+deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse
 EOF
 
 apt-get update -y
@@ -96,574 +88,32 @@ systemctl start mongod
 sleep 5
 
 # ========================
-# CREATE LINUX USER
+# CREATE USER
 # ========================
-echo "### Ensuring Linux user exists ###"
 id -u "${LINUX_USER}" &>/dev/null || useradd -m -s /bin/bash "${LINUX_USER}"
 chmod 755 "${HOME_DIR}"
 
 # ========================
 # DOWNLOAD SOURCE DATA
 # ========================
-echo "### Downloading source data zip ###"
+echo "### Downloading CSV source files ###"
 sudo -u "${LINUX_USER}" wget -O "${HOME_DIR}/${UIN}.zip" "${DATA_URL}"
 
 if [ ! -s "${HOME_DIR}/${UIN}.zip" ]; then
-  echo "ERROR: Download failed or zip is empty."
+  echo "ERROR: Source zip download failed."
   exit 1
 fi
 
-echo "### Unzipping source data ###"
 sudo -u "${LINUX_USER}" unzip -o "${HOME_DIR}/${UIN}.zip" -d "${HOME_DIR}"
 
 # ========================
-# WRITE etl.sql
+# DOWNLOAD SQL FILES FROM GITHUB
 # ========================
-cat > "${HOME_DIR}/etl.sql" <<'EOF'
-DROP DATABASE IF EXISTS POS;
-CREATE DATABASE POS;
-USE POS;
+echo "### Downloading SQL files from GitHub ###"
+sudo -u "${LINUX_USER}" wget -O "${HOME_DIR}/etl.sql" "${ETL_URL}"
+sudo -u "${LINUX_USER}" wget -O "${HOME_DIR}/views.sql" "${VIEWS_URL}"
+sudo -u "${LINUX_USER}" wget -O "${HOME_DIR}/json.sql" "${JSON_URL}"
 
-CREATE TABLE City (
-  zip   DECIMAL(5,0) ZEROFILL PRIMARY KEY,
-  city  VARCHAR(32),
-  state VARCHAR(4)
-) ENGINE=InnoDB;
-
-CREATE TABLE Customer (
-  id        SERIAL PRIMARY KEY,
-  firstName VARCHAR(32),
-  lastName  VARCHAR(30),
-  email     VARCHAR(128),
-  address1  VARCHAR(100),
-  address2  VARCHAR(50),
-  phone     VARCHAR(32),
-  birthdate DATE,
-  zip       DECIMAL(5,0) ZEROFILL,
-  CONSTRAINT fk_customer_city FOREIGN KEY (zip) REFERENCES City(zip)
-) ENGINE=InnoDB;
-
-CREATE TABLE Product (
-  id                SERIAL PRIMARY KEY,
-  name              VARCHAR(128),
-  currentPrice      DECIMAL(6,2),
-  availableQuantity INT
-) ENGINE=InnoDB;
-
-CREATE TABLE `Order` (
-  id          SERIAL PRIMARY KEY,
-  datePlaced  DATE,
-  dateShipped DATE,
-  customer_id BIGINT UNSIGNED,
-  CONSTRAINT fk_order_customer FOREIGN KEY (customer_id) REFERENCES Customer(id)
-) ENGINE=InnoDB;
-
-CREATE TABLE Orderline (
-  order_id   BIGINT UNSIGNED,
-  product_id BIGINT UNSIGNED,
-  quantity   INT,
-  PRIMARY KEY (order_id, product_id),
-  CONSTRAINT fk_orderline_order   FOREIGN KEY (order_id)   REFERENCES `Order`(id),
-  CONSTRAINT fk_orderline_product FOREIGN KEY (product_id) REFERENCES Product(id)
-) ENGINE=InnoDB;
-
-CREATE TABLE PriceHistory (
-  id         SERIAL PRIMARY KEY,
-  oldPrice   DECIMAL(6,2),
-  newPrice   DECIMAL(6,2),
-  ts         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  product_id BIGINT UNSIGNED,
-  CONSTRAINT fk_pricehistory_product FOREIGN KEY (product_id) REFERENCES Product(id)
-) ENGINE=InnoDB;
-
-CREATE TABLE staging_customer (
-  ID VARCHAR(50),
-  FN VARCHAR(255),
-  LN VARCHAR(255),
-  CT VARCHAR(255),
-  ST VARCHAR(255),
-  ZP VARCHAR(50),
-  S1 VARCHAR(255),
-  S2 VARCHAR(255),
-  EM VARCHAR(255),
-  BD VARCHAR(50)
-) ENGINE=InnoDB;
-
-CREATE TABLE staging_orders (
-  OID     VARCHAR(50),
-  CID     VARCHAR(50),
-  Ordered VARCHAR(50),
-  Shipped VARCHAR(50)
-) ENGINE=InnoDB;
-
-CREATE TABLE staging_orderlines (
-  OID VARCHAR(50),
-  PID VARCHAR(50)
-) ENGINE=InnoDB;
-
-CREATE TABLE staging_products (
-  ID             VARCHAR(50),
-  Name           VARCHAR(255),
-  Price          VARCHAR(50),
-  QuantityOnHand VARCHAR(50)
-) ENGINE=InnoDB;
-
-LOAD DATA LOCAL INFILE '/home/tvillanueva/customers.csv'
-INTO TABLE staging_customer
-FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
-LINES TERMINATED BY '\n'
-IGNORE 1 LINES;
-
-LOAD DATA LOCAL INFILE '/home/tvillanueva/orders.csv'
-INTO TABLE staging_orders
-FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
-LINES TERMINATED BY '\n'
-IGNORE 1 LINES;
-
-LOAD DATA LOCAL INFILE '/home/tvillanueva/orderlines.csv'
-INTO TABLE staging_orderlines
-FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
-LINES TERMINATED BY '\n'
-IGNORE 1 LINES;
-
-LOAD DATA LOCAL INFILE '/home/tvillanueva/products.csv'
-INTO TABLE staging_products
-FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
-LINES TERMINATED BY '\n'
-IGNORE 1 LINES
-(@ID, @Name, @Price, @QOH)
-SET
-  ID = @ID,
-  Name = @Name,
-  Price = @Price,
-  QuantityOnHand = @QOH;
-
-INSERT IGNORE INTO City (zip, city, state)
-SELECT DISTINCT
-  CAST(LPAD(NULLIF(ZP,''), 5, '0') AS UNSIGNED) AS zip,
-  CT AS city,
-  ST AS state
-FROM staging_customer
-WHERE NULLIF(ZP,'') IS NOT NULL;
-
-INSERT INTO Customer (id, firstName, lastName, email, address1, address2, phone, birthdate, zip)
-SELECT
-  CAST(ID AS UNSIGNED),
-  FN,
-  LN,
-  NULLIF(EM,''),
-  NULLIF(S1,''),
-  NULLIF(S2,''),
-  NULL,
-  STR_TO_DATE(NULLIF(BD,''), '%m/%d/%Y'),
-  CAST(LPAD(NULLIF(ZP,''), 5, '0') AS UNSIGNED)
-FROM staging_customer;
-
-INSERT INTO Product (id, name, currentPrice, availableQuantity)
-SELECT
-  CAST(ID AS UNSIGNED),
-  Name,
-  CAST(REPLACE(REPLACE(NULLIF(Price,''), '$', ''), ',', '') AS DECIMAL(6,2)),
-  CAST(NULLIF(QuantityOnHand,'') AS UNSIGNED)
-FROM staging_products;
-
-INSERT INTO `Order` (id, datePlaced, dateShipped, customer_id)
-SELECT
-  CAST(OID AS UNSIGNED),
-  CASE
-    WHEN NULLIF(Ordered,'') IS NULL THEN NULL
-    WHEN LOWER(Ordered) = 'cancelled' THEN NULL
-    ELSE DATE(STR_TO_DATE(Ordered, '%Y-%m-%d %H:%i:%s'))
-  END,
-  CASE
-    WHEN NULLIF(Shipped,'') IS NULL THEN NULL
-    WHEN LOWER(Shipped) = 'cancelled' THEN NULL
-    ELSE DATE(STR_TO_DATE(Shipped, '%Y-%m-%d %H:%i:%s'))
-  END,
-  CAST(CID AS UNSIGNED)
-FROM staging_orders;
-
-INSERT INTO Orderline (order_id, product_id, quantity)
-SELECT
-  CAST(OID AS UNSIGNED),
-  CAST(PID AS UNSIGNED),
-  COUNT(*) AS quantity
-FROM staging_orderlines
-GROUP BY CAST(OID AS UNSIGNED), CAST(PID AS UNSIGNED);
-
-DROP TABLE staging_customer;
-DROP TABLE staging_orders;
-DROP TABLE staging_orderlines;
-DROP TABLE staging_products;
-EOF
-
-# ========================
-# WRITE views.sql
-# ========================
-cat > "${HOME_DIR}/views.sql" <<'EOF'
-SOURCE etl.sql;
-USE POS;
-
-DROP VIEW IF EXISTS v_ProductBuyers;
-CREATE VIEW v_ProductBuyers AS
-SELECT
-  p.id   AS productID,
-  p.name AS productName,
-  IFNULL(
-    GROUP_CONCAT(
-      DISTINCT CONCAT(c.id, ' ', c.firstName, ' ', c.lastName)
-      ORDER BY c.id
-      SEPARATOR ', '
-    ),
-    ''
-  ) AS customers
-FROM Product p
-LEFT JOIN Orderline ol
-  ON ol.product_id = p.id
-LEFT JOIN `Order` o
-  ON o.id = ol.order_id
-LEFT JOIN Customer c
-  ON c.id = o.customer_id
-GROUP BY p.id, p.name
-ORDER BY p.id;
-
-DROP TABLE IF EXISTS mv_ProductBuyers;
-CREATE TABLE mv_ProductBuyers AS
-SELECT * FROM v_ProductBuyers;
-
-ALTER TABLE mv_ProductBuyers
-  ADD INDEX idx_mv_productbuyers_productID (productID);
-
-DROP TRIGGER IF EXISTS trg_orderline_ai_mv_productbuyers;
-DROP TRIGGER IF EXISTS trg_orderline_ad_mv_productbuyers;
-DROP TRIGGER IF EXISTS trg_product_bu_pricehistory;
-
-DELIMITER $$
-
-CREATE TRIGGER trg_orderline_ai_mv_productbuyers
-AFTER INSERT ON Orderline
-FOR EACH ROW
-BEGIN
-  UPDATE mv_ProductBuyers
-  SET
-    productName = (SELECT p.name FROM Product p WHERE p.id = NEW.product_id),
-    customers = IFNULL((
-      SELECT GROUP_CONCAT(
-               DISTINCT CONCAT(c.id, ' ', c.firstName, ' ', c.lastName)
-               ORDER BY c.id
-               SEPARATOR ', '
-             )
-      FROM Orderline ol
-      JOIN `Order` o  ON o.id = ol.order_id
-      JOIN Customer c ON c.id = o.customer_id
-      WHERE ol.product_id = NEW.product_id
-    ), '')
-  WHERE productID = NEW.product_id;
-END$$
-
-CREATE TRIGGER trg_orderline_ad_mv_productbuyers
-AFTER DELETE ON Orderline
-FOR EACH ROW
-BEGIN
-  UPDATE mv_ProductBuyers
-  SET
-    productName = (SELECT p.name FROM Product p WHERE p.id = OLD.product_id),
-    customers = IFNULL((
-      SELECT GROUP_CONCAT(
-               DISTINCT CONCAT(c.id, ' ', c.firstName, ' ', c.lastName)
-               ORDER BY c.id
-               SEPARATOR ', '
-             )
-      FROM Orderline ol
-      JOIN `Order` o  ON o.id = ol.order_id
-      JOIN Customer c ON c.id = o.customer_id
-      WHERE ol.product_id = OLD.product_id
-    ), '')
-  WHERE productID = OLD.product_id;
-END$$
-
-CREATE TRIGGER trg_product_bu_pricehistory
-BEFORE UPDATE ON Product
-FOR EACH ROW
-BEGIN
-  IF NOT (NEW.currentPrice <=> OLD.currentPrice) THEN
-    INSERT INTO PriceHistory (oldPrice, newPrice, product_id)
-    VALUES (OLD.currentPrice, NEW.currentPrice, OLD.id);
-  END IF;
-END$$
-
-DELIMITER ;
-EOF
-
-# ========================
-# WRITE json.sql
-# ========================
-cat > "${HOME_DIR}/json.sql" <<'EOF'
-USE POS;
-
--- ============================================================
--- CASE 1: Product Details View
--- prod.json
--- ============================================================
-DROP TEMPORARY TABLE IF EXISTS tmp_product_customer_rows;
-CREATE TEMPORARY TABLE tmp_product_customer_rows AS
-SELECT
-  ol.product_id,
-  c.id AS CustomerID,
-  CONCAT(c.firstName, ' ', c.lastName) AS CustomerName
-FROM Orderline ol
-JOIN `Order` o
-  ON o.id = ol.order_id
-JOIN Customer c
-  ON c.id = o.customer_id
-GROUP BY ol.product_id, c.id, c.firstName, c.lastName;
-
-DROP TEMPORARY TABLE IF EXISTS tmp_product_customer_json;
-CREATE TEMPORARY TABLE tmp_product_customer_json AS
-SELECT
-  product_id,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'CustomerID', CustomerID,
-      'CustomerName', CustomerName
-    )
-  ) AS customers_json
-FROM tmp_product_customer_rows
-GROUP BY product_id;
-
-SELECT JSON_OBJECT(
-  'ProductID', p.id,
-  'currentPrice', p.currentPrice,
-  'productName', p.name,
-  'customers', COALESCE(JSON_EXTRACT(tmp_product_customer_json.customers_json, '$'), JSON_ARRAY())
-)
-FROM Product p
-LEFT JOIN tmp_product_customer_json
-  ON tmp_product_customer_json.product_id = p.id
-ORDER BY p.id
-INTO OUTFILE '/var/lib/mysql-files/prod.json'
-FIELDS TERMINATED BY ''
-ESCAPED BY ''
-LINES TERMINATED BY '\n';
-
--- ============================================================
--- CASE 2: Customer Dashboard
--- cust.json
--- ============================================================
-DROP TEMPORARY TABLE IF EXISTS tmp_item_json;
-CREATE TEMPORARY TABLE tmp_item_json AS
-SELECT
-  ol.order_id,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'ProductID', p.id,
-      'Quantity', ol.quantity,
-      'ProductName', p.name
-    )
-  ) AS items_json,
-  ROUND(COALESCE(SUM(p.currentPrice * ol.quantity), 0), 2) AS order_total
-FROM Orderline ol
-JOIN Product p
-  ON p.id = ol.product_id
-GROUP BY ol.order_id;
-
-DROP TEMPORARY TABLE IF EXISTS tmp_order_json;
-CREATE TEMPORARY TABLE tmp_order_json AS
-SELECT
-  o.customer_id,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'OrderID', o.id,
-      'OrderDate', o.datePlaced,
-      'ShippingDate', o.dateShipped,
-      'OrderTotal', COALESCE(tmp_item_json.order_total, 0),
-      'items', COALESCE(JSON_EXTRACT(tmp_item_json.items_json, '$'), JSON_ARRAY())
-    )
-  ) AS orders_json
-FROM `Order` o
-LEFT JOIN tmp_item_json
-  ON tmp_item_json.order_id = o.id
-GROUP BY o.customer_id;
-
-SELECT JSON_OBJECT(
-  'CustomerID', c.id,
-  'customer_name', CONCAT(c.firstName, ' ', c.lastName),
-  'printed_address_1',
-    CASE
-      WHEN c.address2 IS NULL OR c.address2 = '' THEN c.address1
-      ELSE CONCAT(c.address1, ' #', c.address2)
-    END,
-  'printed_address_2',
-    CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-  'orders', COALESCE(JSON_EXTRACT(tmp_order_json.orders_json, '$'), JSON_ARRAY())
-)
-FROM Customer c
-JOIN City ci
-  ON ci.zip = c.zip
-LEFT JOIN tmp_order_json
-  ON tmp_order_json.customer_id = c.id
-ORDER BY c.id
-INTO OUTFILE '/var/lib/mysql-files/cust.json'
-FIELDS TERMINATED BY ''
-ESCAPED BY ''
-LINES TERMINATED BY '\n';
-
--- ============================================================
--- CASE 3: Inventory Demand Signal
--- custom1.json
--- ============================================================
-DROP TEMPORARY TABLE IF EXISTS tmp_product_order_rows;
-CREATE TEMPORARY TABLE tmp_product_order_rows AS
-SELECT
-  ol.product_id,
-  o.id AS OrderID,
-  o.datePlaced AS OrderDate,
-  c.id AS CustomerID,
-  CONCAT(c.firstName, ' ', c.lastName) AS CustomerName,
-  ci.state AS StateName,
-  ol.quantity AS Quantity
-FROM Orderline ol
-JOIN `Order` o
-  ON o.id = ol.order_id
-JOIN Customer c
-  ON c.id = o.customer_id
-JOIN City ci
-  ON ci.zip = c.zip;
-
-DROP TEMPORARY TABLE IF EXISTS tmp_product_order_json;
-CREATE TEMPORARY TABLE tmp_product_order_json AS
-SELECT
-  product_id,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'OrderID', OrderID,
-      'OrderDate', OrderDate,
-      'Customer',
-        JSON_OBJECT(
-          'CustomerID', CustomerID,
-          'CustomerName', CustomerName,
-          'State', StateName
-        ),
-      'Quantity', Quantity
-    )
-  ) AS recent_orders_json
-FROM tmp_product_order_rows
-GROUP BY product_id;
-
-DROP TEMPORARY TABLE IF EXISTS tmp_product_rollup;
-CREATE TEMPORARY TABLE tmp_product_rollup AS
-SELECT
-  ol.product_id,
-  SUM(ol.quantity) AS total_units_sold,
-  COUNT(DISTINCT o.customer_id) AS unique_customer_count
-FROM Orderline ol
-JOIN `Order` o
-  ON o.id = ol.order_id
-GROUP BY ol.product_id;
-
-SELECT JSON_OBJECT(
-  'ProductID', p.id,
-  'productName', p.name,
-  'currentPrice', p.currentPrice,
-  'availableQuantity', p.availableQuantity,
-  'total_units_sold', COALESCE(tmp_product_rollup.total_units_sold, 0),
-  'unique_customer_count', COALESCE(tmp_product_rollup.unique_customer_count, 0),
-  'recent_orders', COALESCE(JSON_EXTRACT(tmp_product_order_json.recent_orders_json, '$'), JSON_ARRAY())
-)
-FROM Product p
-LEFT JOIN tmp_product_rollup
-  ON tmp_product_rollup.product_id = p.id
-LEFT JOIN tmp_product_order_json
-  ON tmp_product_order_json.product_id = p.id
-ORDER BY p.id
-INTO OUTFILE '/var/lib/mysql-files/custom1.json'
-FIELDS TERMINATED BY ''
-ESCAPED BY ''
-LINES TERMINATED BY '\n';
-
--- ============================================================
--- CASE 4: Regional Delivery Manifest
--- custom2.json
--- ============================================================
-DROP TEMPORARY TABLE IF EXISTS tmp_delivery_item_json;
-CREATE TEMPORARY TABLE tmp_delivery_item_json AS
-SELECT
-  ol.order_id,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'ProductID', p.id,
-      'ProductName', p.name,
-      'Quantity', ol.quantity
-    )
-  ) AS items_json
-FROM Orderline ol
-JOIN Product p
-  ON p.id = ol.product_id
-GROUP BY ol.order_id;
-
-DROP TEMPORARY TABLE IF EXISTS tmp_delivery_order_json;
-CREATE TEMPORARY TABLE tmp_delivery_order_json AS
-SELECT
-  o.customer_id,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'OrderID', o.id,
-      'OrderDate', o.datePlaced,
-      'ShippingDate', o.dateShipped,
-      'items', COALESCE(JSON_EXTRACT(tmp_delivery_item_json.items_json, '$'), JSON_ARRAY())
-    )
-  ) AS orders_json
-FROM `Order` o
-LEFT JOIN tmp_delivery_item_json
-  ON tmp_delivery_item_json.order_id = o.id
-GROUP BY o.customer_id;
-
-DROP TEMPORARY TABLE IF EXISTS tmp_customer_json_by_state;
-CREATE TEMPORARY TABLE tmp_customer_json_by_state AS
-SELECT
-  ci.state,
-  JSON_ARRAYAGG(
-    JSON_OBJECT(
-      'CustomerID', c.id,
-      'CustomerName', CONCAT(c.firstName, ' ', c.lastName),
-      'printed_address_1',
-        CASE
-          WHEN c.address2 IS NULL OR c.address2 = '' THEN c.address1
-          ELSE CONCAT(c.address1, ' #', c.address2)
-        END,
-      'printed_address_2',
-        CONCAT(ci.city, ', ', ci.state, '   ', LPAD(ci.zip, 5, '0')),
-      'orders', COALESCE(JSON_EXTRACT(tmp_delivery_order_json.orders_json, '$'), JSON_ARRAY())
-    )
-  ) AS customers_json
-FROM Customer c
-JOIN City ci
-  ON ci.zip = c.zip
-LEFT JOIN tmp_delivery_order_json
-  ON tmp_delivery_order_json.customer_id = c.id
-GROUP BY ci.state;
-
-SELECT JSON_OBJECT(
-  'State', s.state,
-  'customers', COALESCE(JSON_EXTRACT(tmp_customer_json_by_state.customers_json, '$'), JSON_ARRAY())
-)
-FROM (
-  SELECT DISTINCT state
-  FROM City
-  WHERE state IS NOT NULL AND state <> ''
-) s
-LEFT JOIN tmp_customer_json_by_state
-  ON tmp_customer_json_by_state.state = s.state
-ORDER BY s.state
-INTO OUTFILE '/var/lib/mysql-files/custom2.json'
-FIELDS TERMINATED BY ''
-ESCAPED BY ''
-LINES TERMINATED BY '\n';
-EOF
-
-# ========================
-# PERMISSIONS
-# ========================
 chown "${LINUX_USER}:${LINUX_USER}" \
   "${HOME_DIR}/etl.sql" \
   "${HOME_DIR}/views.sql" \
@@ -677,12 +127,12 @@ chmod 644 \
 # ========================
 # BUILD MARIADB DATABASE
 # ========================
-echo "### Building POS database from views.sql ###"
+echo "### Building POS database ###"
 cd "${HOME_DIR}"
-mariadb --local-infile=1 < views.sql
+mariadb --local-infile=1 < "${HOME_DIR}/views.sql"
 
 # ========================
-# CREATE sync.sh
+# WRITE sync.sh
 # ========================
 echo "### Writing sync.sh ###"
 cat > "${HOME_DIR}/sync.sh" <<'EOF'
@@ -699,7 +149,7 @@ exec >> "$LOG_FILE" 2>&1
 echo "=================================================="
 echo "sync.sh started at $(date)"
 
-echo "[1/3] CLEAN - deleting old JSON exports"
+echo "[1/3] CLEAN - deleting old JSON files"
 rm -f "${MYSQL_JSON_DIR}/prod.json" \
       "${MYSQL_JSON_DIR}/cust.json" \
       "${MYSQL_JSON_DIR}/custom1.json" \
@@ -707,9 +157,9 @@ rm -f "${MYSQL_JSON_DIR}/prod.json" \
 
 echo "[2/3] EXTRACT - regenerating JSON from MariaDB"
 cd "${HOME_DIR}"
-mariadb < json.sql
+mariadb < "${HOME_DIR}/json.sql"
 
-echo "[3/3] LOAD - refreshing MongoDB collections"
+echo "[3/3] LOAD - importing into MongoDB"
 mongoimport --db "${MONGO_DB}" --collection Products  --file "${MYSQL_JSON_DIR}/prod.json"    --drop
 mongoimport --db "${MONGO_DB}" --collection Customers --file "${MYSQL_JSON_DIR}/cust.json"    --drop
 mongoimport --db "${MONGO_DB}" --collection Custom1   --file "${MYSQL_JSON_DIR}/custom1.json" --drop
@@ -729,7 +179,7 @@ echo "### Running initial sync ###"
 bash "${HOME_DIR}/sync.sh"
 
 # ========================
-# SCHEDULE CRON JOB
+# SCHEDULE CRON
 # ========================
 echo "### Scheduling cron job ###"
 cat > /etc/cron.d/istm622-sync <<EOF
@@ -737,18 +187,18 @@ cat > /etc/cron.d/istm622-sync <<EOF
 EOF
 
 chmod 644 /etc/cron.d/istm622-sync
-systemctl restart cron || systemctl restart crond || true
+systemctl enable cron
+systemctl restart cron
 
 # ========================
-# FINAL VALIDATION OUTPUT
+# FINAL VALIDATION
 # ========================
-echo "### Final validation ###"
+echo "### Validation output ###"
 systemctl status mariadb --no-pager || true
 systemctl status mongod --no-pager || true
 ls -l /var/lib/mysql-files/ || true
-crontab -l || true
 cat /etc/cron.d/istm622-sync || true
 mongosh --quiet --eval "db.getSiblingDB(\"${MONGO_DB}\").Customers.countDocuments()"
 
-echo "### MongoDB Milestone setup completed successfully ###"
-echo "### Check /var/log/user-data.log and /var/log/sync.log for troubleshooting ###"
+echo "### Setup complete ###"
+echo "### Check /var/log/user-data.log and /var/log/sync.log if needed ###"
